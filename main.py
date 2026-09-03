@@ -1974,7 +1974,7 @@ async def handle_payment_reject(callback: CallbackQuery) -> None:
 # ============================================================================
 
 
-@router.message(Command("adminOpen"))
+@router.message(Command("adminopen"))
 async def handle_admin_open(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
