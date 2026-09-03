@@ -2161,7 +2161,7 @@ async def handle_admin_password(message: Message, state: FSMContext) -> None:
 
 
 # ============================================================================
-# 13. ADMIN — MAIN PANEL NAVIGATION & NEW ADMIN FEATURES
+# 13. ADMIN — MAIN PANEL NAVIGATION & MANAGEMENT FEATURES
 # ============================================================================
 
 
@@ -2501,34 +2501,30 @@ async def handle_admin_toggle_bot(callback: CallbackQuery) -> None:
 
 
 # ============================================================================
-# 14. ADMIN — USERS LIST, PROFILE, BLOCK/UNBLOCK, PRIME
+# 14. ADMIN — USER MANAGEMENT (PROFILES, BLOCK, PRIME, HISTORY, BRIDGE)
 # ============================================================================
 
 
 @router.callback_query(F.data.startswith("adm_users:"))
-async def handle_admin_users_list(callback: CallbackQuery) -> None:
+async def handle_admin_users_page(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
     page = int(callback.data.split(":")[1])
     total = await count_users()
     total_pages = max(1, (total + 9) // 10)
     users_page = await get_users_page(page)
     text = f"👥 <b>Foydalanuvchilar</b> ({total} ta)\nSahifa: {page + 1}/{total_pages}"
-    await callback.message.edit_text(
-        text, reply_markup=admin_users_list_with_buttons(users_page, page, total_pages)
-    )
+    await callback.message.edit_text(text, reply_markup=admin_users_list_with_buttons(users_page, page, total_pages))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm_profile:"))
 async def handle_admin_user_profile(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    _, target_id_str, back_page_str = callback.data.split(":")
-    target_id = int(target_id_str)
-    back_page = int(back_page_str)
+    parts = callback.data.split(":")
+    target_id = int(parts[1])
+    back_page = int(parts[2])
     db_user = await get_user(target_id)
     if not db_user:
         await callback.answer("Foydalanuvchi topilmadi.", show_alert=True)
@@ -2546,16 +2542,17 @@ async def handle_admin_user_profile(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("adm_block:"))
 async def handle_admin_block_user(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    _, target_id_str, back_page_str = callback.data.split(":")
-    target_id = int(target_id_str)
-    back_page = int(back_page_str)
-    await set_block_status(target_id, True)
+    parts = callback.data.split(":")
+    target_id = int(parts[1])
+    back_page = int(parts[2])
+    await set_block_status(target_id, blocked=True)
     db_user = await get_user(target_id)
     await callback.message.edit_text(
         format_user_profile(db_user),
-        reply_markup=admin_profile_keyboard(target_id, True, bool(db_user["is_prime"]), back_page),
+        reply_markup=admin_profile_keyboard(
+            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
+        ),
     )
     await callback.answer("Foydalanuvchi bloklandi.")
 
@@ -2563,191 +2560,198 @@ async def handle_admin_block_user(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("adm_unblock:"))
 async def handle_admin_unblock_user(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    _, target_id_str, back_page_str = callback.data.split(":")
-    target_id = int(target_id_str)
-    back_page = int(back_page_str)
-    await set_block_status(target_id, False)
+    parts = callback.data.split(":")
+    target_id = int(parts[1])
+    back_page = int(parts[2])
+    await set_block_status(target_id, blocked=False)
     db_user = await get_user(target_id)
     await callback.message.edit_text(
         format_user_profile(db_user),
-        reply_markup=admin_profile_keyboard(target_id, False, bool(db_user["is_prime"]), back_page),
+        reply_markup=admin_profile_keyboard(
+            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
+        ),
     )
     await callback.answer("Foydalanuvchi blokdan chiqarildi.")
 
 
 @router.callback_query(F.data.startswith("adm_give_prime:"))
-async def handle_admin_give_prime_menu(callback: CallbackQuery) -> None:
+async def handle_admin_give_prime_prompt(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    _, target_id_str, back_page_str = callback.data.split(":")
-    target_id = int(target_id_str)
-    back_page = int(back_page_str)
+    parts = callback.data.split(":")
+    target_id = int(parts[1])
+    back_page = int(parts[2])
     await callback.message.edit_text(
-        "⭐ Necha oylik Prime bermoqchisiz?",
+        f"⭐ <code>{target_id}</code> IDli foydalanuvchiga necha oyga Prime berishni tanlang:",
         reply_markup=prime_months_keyboard(target_id, back_page),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm_set_prime:"))
-async def handle_admin_set_prime(callback: CallbackQuery) -> None:
+async def handle_admin_set_prime_execute(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    _, target_id_str, months_str, back_page_str = callback.data.split(":")
-    target_id = int(target_id_str)
-    months = int(months_str)
-    back_page = int(back_page_str)
+    parts = callback.data.split(":")
+    target_id = int(parts[1])
+    months = int(parts[2])
+    back_page = int(parts[3])
     await grant_prime(target_id, months)
     db_user = await get_user(target_id)
     await callback.message.edit_text(
-        format_user_profile(db_user),
-        reply_markup=admin_profile_keyboard(target_id, bool(db_user["is_blocked"]), True, back_page),
+        f"✅ {months} oyga Prime berildi!\n\n" + format_user_profile(db_user),
+        reply_markup=admin_profile_keyboard(
+            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
+        ),
     )
     try:
-        await bot.send_message(target_id, f"🎉 Sizga {months} oylik Prime tarif berildi!")
+        await bot.send_message(
+            target_id,
+            f"🎉 Tabriklaymiz! Sizga {months} oyga Prime tarifi taqdim etildi! "
+            f"Endi botdan cheksiz foydalanishingiz mumkin.",
+        )
     except (TelegramBadRequest, TelegramForbiddenError):
         pass
     await callback.answer("Prime berildi.")
 
 
 @router.callback_query(F.data.startswith("adm_take_prime:"))
-async def handle_admin_take_prime(callback: CallbackQuery) -> None:
+async def handle_admin_take_prime_execute(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    _, target_id_str, back_page_str = callback.data.split(":")
-    target_id = int(target_id_str)
-    back_page = int(back_page_str)
+    parts = callback.data.split(":")
+    target_id = int(parts[1])
+    back_page = int(parts[2])
     await revoke_prime(target_id)
     db_user = await get_user(target_id)
     await callback.message.edit_text(
-        format_user_profile(db_user),
-        reply_markup=admin_profile_keyboard(target_id, bool(db_user["is_blocked"]), False, back_page),
+        "🚫 Prime olib qo'yildi.\n\n" + format_user_profile(db_user),
+        reply_markup=admin_profile_keyboard(
+            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
+        ),
     )
-    try:
-        await bot.send_message(target_id, "ℹ️ Sizning Prime tarifingiz bekor qilindi.")
-    except (TelegramBadRequest, TelegramForbiddenError):
-        pass
     await callback.answer("Prime olib qo'yildi.")
 
 
 @router.callback_query(F.data.startswith("adm_history:"))
-async def handle_admin_view_history(callback: CallbackQuery) -> None:
+async def handle_admin_view_user_history(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    _, target_id_str, back_page_str = callback.data.split(":")
-    target_id = int(target_id_str)
-    rows = await get_full_user_history(target_id)
-    if not rows:
-        await callback.answer("Yozishmalar topilmadi.", show_alert=True)
+    parts = callback.data.split(":")
+    target_id = int(parts[1])
+    back_page = int(parts[2])
+
+    history = await get_full_user_history(target_id)
+    if not history:
+        await callback.answer("Bu foydalanuvchida suhbatlar tarixi mavjud emas.", show_alert=True)
         return
-    await callback.answer("Yozishmalar yuborilmoqda...")
-    chunk = ""
-    for row in rows:
-        role_label = "👤 Foydalanuvchi" if row["role"] == "user" else "🤖 AI"
-        line = f"[{row['timestamp'][:16]}] {role_label} (bo'lim: {row['section_id']}):\n{row['content']}\n\n"
-        if len(chunk) + len(line) > 3500:
-            await bot.send_message(callback.from_user.id, chunk)
-            chunk = ""
-        chunk += line
-    if chunk:
-        await bot.send_message(callback.from_user.id, chunk)
+
+    full_text = f"💬 <b>Foydalanuvchi ({target_id}) suhbatlar tarixi:</b>\n\n"
+    for row in history[-30:]:
+        role = "👤" if row["role"] == "user" else "🤖"
+        full_text += f"{role} [{row['timestamp'][11:16]}]: {row['content'][:150]}\n"
+
+    if len(full_text) > 4000:
+        full_text = full_text[:4000] + "\n..."
+
+    await callback.message.edit_text(
+        full_text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"adm_profile:{target_id}:{back_page}")]]
+        ),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("adm_bridge:"))
-async def handle_admin_bridge_start(callback: CallbackQuery, state: FSMContext) -> None:
+async def handle_admin_start_bridge(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    _, target_id_str, back_page_str = callback.data.split(":")
-    target_id = int(target_id_str)
+    parts = callback.data.split(":")
+    target_id = int(parts[1])
+
     RUNTIME_CACHE["bridge_targets"][callback.from_user.id] = target_id
     RUNTIME_CACHE["admin_awaiting_reply_from"][target_id] = callback.from_user.id
+
     await state.set_state(AdminBridgeStates.active)
     await callback.message.answer(
-        f"✍️ Bridge rejimi yoqildi. Endi yozgan xabarlaringiz to'g'ridan-to'g'ri "
-        f"foydalanuvchiga (<code>{target_id}</code>) yuboriladi.",
+        f"✍️ <code>{target_id}</code> IDli foydalanuvchi bilan Bridge (jonli muloqot) rejimi yoqildi.\n"
+        f"Yozgan xabarlaringiz to'g'ridan-to'g'ri unga boradi.\n"
+        f"Tugatish uchun \"🛑 Bridge'ni tugatish\" tugmasini bosing.",
         reply_markup=bridge_end_keyboard(),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "adm_bridge_stop")
-async def handle_admin_bridge_stop(callback: CallbackQuery, state: FSMContext) -> None:
+async def handle_admin_stop_bridge(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    target_id = RUNTIME_CACHE["bridge_targets"].pop(callback.from_user.id, None)
+    admin_id = callback.from_user.id
+    target_id = RUNTIME_CACHE["bridge_targets"].pop(admin_id, None)
     if target_id:
         RUNTIME_CACHE["admin_awaiting_reply_from"].pop(target_id, None)
     await state.clear()
-    await callback.message.edit_text("🛑 Bridge rejimi tugatildi.")
+    await callback.message.edit_text("🛑 Bridge rejimi yakunlandi.")
+    await callback.message.answer("Admin panel:", reply_markup=admin_panel_reply_keyboard())
     await callback.answer()
 
 
-@router.message(StateFilter(AdminBridgeStates.active), F.contact)
-async def handle_admin_bridge_contact(message: Message) -> None:
-    admin_id = message.from_user.id
-    target_id = RUNTIME_CACHE["bridge_targets"].get(admin_id)
-    if not target_id:
-        await message.answer("Bridge rejimi faol emas.")
-        return
-    try:
-        contact = message.contact
-        await bot.send_contact(
-            target_id,
-            phone_number=contact.phone_number,
-            first_name=contact.first_name,
-            last_name=contact.last_name or "",
-        )
-        await message.answer("✅ Kontakt yuborildi.")
-    except (TelegramBadRequest, TelegramForbiddenError):
-        await message.answer("❌ Foydalanuvchiga kontakt yuborib bo'lmadi.")
-
-
 @router.message(StateFilter(AdminBridgeStates.active), F.text)
-async def handle_admin_bridge_message(message: Message) -> None:
+async def handle_admin_bridge_message(message: Message, state: FSMContext) -> None:
     admin_id = message.from_user.id
     target_id = RUNTIME_CACHE["bridge_targets"].get(admin_id)
     if not target_id:
-        await message.answer("Bridge rejimi faol emas.")
+        await state.clear()
+        await message.answer("Bridge target topilmadi.", reply_markup=admin_panel_reply_keyboard())
         return
-    try:
-        await bot.send_message(target_id, f"✍️ <b>Admin:</b>\n\n{message.text}")
-        await message.answer("✅ Yuborildi.")
-    except (TelegramBadRequest, TelegramForbiddenError):
-        await message.answer("❌ Foydalanuvchiga xabar yuborib bo'lmadi.")
 
-
-@router.message(F.text, F.from_user.id.func(lambda uid: uid in RUNTIME_CACHE["admin_awaiting_reply_from"]))
-async def handle_user_reply_to_bridge(message: Message) -> None:
-    admin_id = RUNTIME_CACHE["admin_awaiting_reply_from"].get(message.from_user.id)
-    if not admin_id:
-        return
     try:
         await bot.send_message(
-            admin_id,
-            f"👤 <b>{message.from_user.full_name}</b> (<code>{message.from_user.id}</code>) javobi:\n\n{message.text}",
+            target_id,
+            f"👨‍💻 <b>Admin:</b>\n\n{message.text}",
         )
-    except (TelegramBadRequest, TelegramForbiddenError):
-        pass
+        await message.answer("✅ Xabar yuborildi.", reply_markup=bridge_end_keyboard())
+    except (TelegramBadRequest, TelegramForbiddenError) as err:
+        await message.answer(f"❌ Xabar yetkazilmadi: {err}", reply_markup=bridge_end_keyboard())
 
 
 # ============================================================================
-# 15. MAIN STARTUP & BOT ENTRYPOINT
+# 15. GLOBAL ROUTER FOR BRIDGE REVERSE MESSAGES FROM USERS
+# ============================================================================
+
+
+@router.message(F.text, F.from_user.id.func(lambda uid: uid in RUNTIME_CACHE["admin_awaiting_reply_from"]))
+async def handle_user_bridge_reply(message: Message) -> None:
+    user_id = message.from_user.id
+    admin_id = RUNTIME_CACHE["admin_awaiting_reply_from"].get(user_id)
+    if admin_id:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"💬 <b>Foydalanuvchi ({user_id}) javob berdi:</b>\n\n{message.text}",
+                reply_markup=bridge_end_keyboard(),
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+
+
+# ============================================================================
+# 16. APPLICATION STARTUP & MAIN LOOP
 # ============================================================================
 
 
 async def main() -> None:
-    logger.info("MHDV AI Bot ishga tushmoqda...")
+    logger.info("Bot ma'lumotlar bazasi va tizim komponentlari ishga tushirilmoqda...")
     await init_db()
+
+    bot_status = await get_setting("bot_status", "on")
+    RUNTIME_CACHE["bot_enabled"] = (bot_status == "on")
+
+    logger.info("Bot Telegram API ga muvaffaqiyatli ulandi va so'rovlarni qabul qilishni boshladi.")
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await dp.start_polling(bot)
     finally:
         await bot.session.close()
 
