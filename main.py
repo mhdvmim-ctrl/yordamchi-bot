@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import sys
 import time
 from datetime import datetime, timedelta
 
@@ -24,6 +25,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardRemove,
+    FSInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
@@ -71,6 +73,7 @@ RUNTIME_CACHE: dict = {
     "bot_enabled": True,
     "bridge_targets": {},        # admin_id -> target_user_id
     "admin_awaiting_reply_from": {},  # target_user_id -> admin_id (for reverse lookup)
+    "admin_in_panel": set(),      # Set of admin_ids currently locked inside admin panel
 }
 
 # ============================================================================
@@ -274,6 +277,16 @@ async def init_db() -> None:
             );
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                note_text TEXT,
+                created_at TEXT
+            );
+            """
+        )
         await db.commit()
 
     await seed_default_settings()
@@ -287,6 +300,8 @@ async def seed_default_settings() -> None:
         "bot_status": "on",
         "admin_card": "4880 0000 0000 0000",
         "admin_contact_link": "https://t.me/admin",
+        "start_welcome_msg": "👋 Assalomu alaykum! MHDV AI botiga xush kelibsiz.\n\nQuyidagi menyudan kerakli bo'limni tanlang:",
+        "bot_disabled_msg": "🔧 Bot hozirda texnik ishlar tufayli vaqtincha o'chirilgan. Iltimos, keyinroq urinib ko'ring.",
         "mhdv_info": (
             "👤 <b>MHDV haqida</b>\n\n"
             "Mahmudxonov Ibrohimxon — 2010-yil 5-dekabrda Namangan viloyati Kosonsoy tumanida tug'ilgan, "
@@ -569,6 +584,37 @@ async def add_channel(channel_id: str, channel_title: str, channel_link: str) ->
 async def remove_channel(channel_db_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM channels WHERE id = ?", (channel_db_id,))
+        await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# User Notes CRUD
+# ---------------------------------------------------------------------------
+
+
+async def add_user_note(user_id: int, text: str) -> None:
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO user_notes (user_id, note_text, created_at) VALUES (?, ?, ?)",
+            (user_id, text, now),
+        )
+        await db.commit()
+
+
+async def get_user_notes(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM user_notes WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+            (user_id,),
+        )
+        return await cursor.fetchall()
+
+
+async def clear_user_notes(user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM user_notes WHERE user_id = ?", (user_id,))
         await db.commit()
 
 
@@ -948,6 +994,28 @@ class AdminSettingsStates(StatesGroup):
     waiting_contact = State()
 
 
+class UserNoteStates(StatesGroup):
+    waiting_note_text = State()
+
+
+class UserDictStates(StatesGroup):
+    waiting_word = State()
+
+
+class UserMathStates(StatesGroup):
+    waiting_expression = State()
+
+
+class AdminWarnStates(StatesGroup):
+    waiting_user_id = State()
+    waiting_reason = State()
+
+
+class AdminAutoReplyStates(StatesGroup):
+    waiting_key_choice = State()
+    waiting_new_value = State()
+
+
 # ============================================================================
 # 6. KEYBOARDS
 # ============================================================================
@@ -959,6 +1027,9 @@ def main_reply_menu() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🌐 Veb-sayt zakaz"), KeyboardButton(text="🎨 Logo/Dizayn zakaz")],
         [KeyboardButton(text="⭐ Prime olish"), KeyboardButton(text="📊 Mening rejimim")],
         [KeyboardButton(text="⚡ Tezkor maslahatlar"), KeyboardButton(text="💬 Kundalik motivatsiya")],
+        [KeyboardButton(text="🎲 Tasodifiy Fakt"), KeyboardButton(text="🌐 Lug'at & Imlo")],
+        [KeyboardButton(text="💡 Kun g'oyasi"), KeyboardButton(text="🧮 Calculator & AI Resolver")],
+        [KeyboardButton(text="📑 Shaxsiy Eslatmalar")],
         [KeyboardButton(text="👤 MHDV haqida"), KeyboardButton(text="🤖 Bot haqida")],
         [KeyboardButton(text="📜 Qoidalar"), KeyboardButton(text="🌐 Ijtimoiy tarmoqlar")],
         [KeyboardButton(text="✍️ Admin bilan muloqot"), KeyboardButton(text="💡 Taklif va shikoyatlar")],
@@ -1064,6 +1135,9 @@ def admin_panel_reply_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📺 Kanallar boshqaruvi"), KeyboardButton(text="➕ Kanal qo'shish")],
         [KeyboardButton(text="✏️ Matnlarni tahrirlash"), KeyboardButton(text="🔑 API kalit qo'shish")],
         [KeyboardButton(text="💳 Karta raqamini o'zgartirish"), KeyboardButton(text="🔗 Admin shaxsiy chat linki")],
+        [KeyboardButton(text="✏️ Avto-javob matnlarini o'zgartirish")],
+        [KeyboardButton(text="📜 Tizim Loglarini Ko'rish"), KeyboardButton(text="⚠️ Foydalanuvchini Ogohlantirish")],
+        [KeyboardButton(text="📊 Tizim Resurslari (RAM/CPU)"), KeyboardButton(text="⚡ Tezkor DB Backup")],
         [KeyboardButton(text="🧹 RAM keshni tozalash"), KeyboardButton(text="🔌 Botni yoqish/o'chirish")],
         [KeyboardButton(text="🚪 Chiqish")],
     ]
@@ -1151,6 +1225,16 @@ def edit_texts_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def auto_reply_edit_choice_keyboard() -> InlineKeyboardMarkup:
+    keys = [
+        ("start_welcome_msg", "👋 /start Xabari"),
+        ("bot_disabled_msg", "🔧 Bot O'chirilgan Matni"),
+    ]
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"adm_edit_autoreply:{key}")] for key, label in keys]
+    rows.append([InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adm_back_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def bridge_end_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🛑 Bridge'ni tugatish", callback_data="adm_bridge_stop")]]
@@ -1207,7 +1291,8 @@ async def ensure_registered_and_active(message: Message) -> bool:
         return False
 
     if not RUNTIME_CACHE["bot_enabled"] and not is_admin(user.id):
-        await message.answer("🔧 Bot hozirda texnik ishlar tufayli vaqtincha o'chirilgan. Iltimos, keyinroq urinib ko'ring.")
+        disabled_msg = await get_setting("bot_disabled_msg", "🔧 Bot hozirda texnik ishlar tufayli vaqtincha o'chirilgan.")
+        await message.answer(disabled_msg)
         return False
 
     if not is_admin(user.id):
@@ -1270,15 +1355,36 @@ async def handle_start(message: Message, state: FSMContext) -> None:
     allowed = await ensure_registered_and_active(message)
     if not allowed:
         return
+    welcome_msg = await get_setting(
+        "start_welcome_msg",
+        "👋 Assalomu alaykum! MHDV AI botiga xush kelibsiz.\n\nQuyidagi menyudan kerakli bo'limni tanlang:"
+    )
     await message.answer(
-        "👋 Assalomu alaykum! MHDV AI botiga xush kelibsiz.\n\n"
-        "Quyidagi menyudan kerakli bo'limni tanlang:",
+        welcome_msg,
         reply_markup=main_reply_menu(),
     )
 
 
+@router.message(F.text == "/exit")
+async def handle_cmd_exit(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    if user_id in RUNTIME_CACHE["admin_in_panel"]:
+        RUNTIME_CACHE["admin_in_panel"].remove(user_id)
+        await state.clear()
+        await message.answer("🚪 Admin paneldan chiqdingiz. Foydalanuvchi rejimi belgilandi.", reply_markup=main_reply_menu())
+        return
+
+    await state.clear()
+    await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
+
+
 @router.message(F.text == "🚪 Chiqish")
 async def handle_global_exit(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    if user_id in RUNTIME_CACHE["admin_in_panel"]:
+        await message.answer("⚠️ Admin paneldan to'liq chiqish uchun shunchaki <code>/exit</code> deb yozing!", parse_mode=ParseMode.HTML)
+        return
+
     await state.clear()
     await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
 
@@ -1354,6 +1460,132 @@ async def handle_daily_quote(message: Message) -> None:
         return
     text = await get_setting("daily_quote")
     await message.answer(text)
+
+
+# --- 5 TA YANGI FOYDALANUVCHI FUNKSIYALARI ---
+
+@router.message(F.text == "🎲 Tasodifiy Fakt")
+async def handle_random_fact(message: Message) -> None:
+    if not await ensure_registered_and_active(message):
+        return
+    thinking_msg = await message.answer("⏳ AI qiziqarli fakt o'ylab topmoqda...")
+    try:
+        fact = await call_gemini_with_failover(
+            system_prompt="Siz dunyo mo'jizalari va ilm-fan bo'yicha ekspert bilmdonsiz.",
+            history_rows=[],
+            new_user_message="Menga dunyo, ilm-fan yoki tarix haqida bitta juda qiziqarli va nodir fakt aytib ber.",
+        )
+        await thinking_msg.edit_text(f"🎲 <b>Qiziqarli Fakt:</b>\n\n{fact}")
+    except Exception as err:
+        logger.error("Fact error: %s", err)
+        await thinking_msg.edit_text("❌ Fakt olishda xatolik yuz berdi.")
+
+
+@router.message(F.text == "🌐 Lug'at & Imlo")
+async def handle_dict_start(message: Message, state: FSMContext) -> None:
+    if not await ensure_registered_and_active(message):
+        return
+    await state.set_state(UserDictStates.waiting_word)
+    await message.answer("🌐 Ma'nosini yoki imlosini bilmoqchi bo'lgan so'zingizni yuboring:", reply_markup=exit_keyboard())
+
+
+@router.message(StateFilter(UserDictStates.waiting_word), F.text)
+async def handle_dict_process(message: Message, state: FSMContext) -> None:
+    if message.text in ("🚪 Chiqish", "/exit"):
+        await state.clear()
+        await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
+        return
+    word = message.text.strip()
+    thinking_msg = await message.answer("⏳ Tahlil qilinmoqda...")
+    try:
+        res = await call_gemini_with_failover(
+            system_prompt="Siz tilshunos va lug'at ekspertsiz.",
+            history_rows=[],
+            new_user_message=f"'{word}' so'zining to'g'ri imlosi, ma'nosi va ishlatilishiga misol keltirib bering.",
+        )
+        await state.clear()
+        await thinking_msg.edit_text(f"🌐 <b>Lug'at & Imlo Tahlili:</b>\n\n{res}")
+        await message.answer("Menyu:", reply_markup=main_reply_menu())
+    except Exception as err:
+        logger.error("Dict error: %s", err)
+        await thinking_msg.edit_text("❌ Xatolik yuz berdi.")
+
+
+@router.message(F.text == "💡 Kun g'oyasi")
+async def handle_daily_idea(message: Message) -> None:
+    if not await ensure_registered_and_active(message):
+        return
+    thinking_msg = await message.answer("⏳ AI bugungi g'oyani tayyorlamoqda...")
+    try:
+        idea = await call_gemini_with_failover(
+            system_prompt="Siz shaxsiy rivojlanish va kreativ g'oyalar muallifisiz.",
+            history_rows=[],
+            new_user_message="Bugun foydalanuvchi bajarishi mumkin bo'lgan bitta foydali va kreativ g'oya (ish, unumdorlik yoki hordiq bo'yicha) ber.",
+        )
+        await thinking_msg.edit_text(f"💡 <b>Bugungi Kun G'oyasi:</b>\n\n{idea}")
+    except Exception as err:
+        logger.error("Idea error: %s", err)
+        await thinking_msg.edit_text("❌ G'oya olishda xatolik yuz berdi.")
+
+
+@router.message(F.text == "🧮 Calculator & AI Resolver")
+async def handle_math_start(message: Message, state: FSMContext) -> None:
+    if not await ensure_registered_and_active(message):
+        return
+    await state.set_state(UserMathStates.waiting_expression)
+    await message.answer("🧮 Matematik ifoda, masala yoki mantiqiy savolingizni yuboring:", reply_markup=exit_keyboard())
+
+
+@router.message(StateFilter(UserMathStates.waiting_expression), F.text)
+async def handle_math_process(message: Message, state: FSMContext) -> None:
+    if message.text in ("🚪 Chiqish", "/exit"):
+        await state.clear()
+        await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
+        return
+    expr = message.text.strip()
+    thinking_msg = await message.answer("⏳ AI yechim tayyorlamoqda...")
+    try:
+        res = await call_gemini_with_failover(
+            system_prompt="Siz kuchli matematik va mantiq profesorisiz.",
+            history_rows=[],
+            new_user_message=f"Ushbu masalani/matematik ifodani bosqichma-bosqich yechib bering va aniq javobni ko'rsating:\n{expr}",
+        )
+        await state.clear()
+        await thinking_msg.edit_text(f"🧮 <b>Matematik Yechim:</b>\n\n{res}")
+        await message.answer("Menyu:", reply_markup=main_reply_menu())
+    except Exception as err:
+        logger.error("Math error: %s", err)
+        await thinking_msg.edit_text("❌ Yechishda xatolik yuz berdi.")
+
+
+@router.message(F.text == "📑 Shaxsiy Eslatmalar")
+async def handle_user_notes(message: Message, state: FSMContext) -> None:
+    if not await ensure_registered_and_active(message):
+        return
+    notes = await get_user_notes(message.from_user.id)
+    text = "📑 <b>Sizning Shaxsiy Eslatmalaringiz:</b>\n\n"
+    if not notes:
+        text += "<i>Hozircha hech qanday eslatma yo'q.</i>\n\n"
+    else:
+        for idx, n in enumerate(notes, 1):
+            text += f"{idx}. {n['note_text']} <i>({n['created_at'][:10]})</i>\n"
+    text += "\nYangi eslatma yozish uchun matn yuboring yoki '🚪 Chiqish' tugmasini bosing:"
+    await state.set_state(UserNoteStates.waiting_note_text)
+    await message.answer(text, reply_markup=exit_keyboard())
+
+
+@router.message(StateFilter(UserNoteStates.waiting_note_text), F.text)
+async def handle_save_user_note(message: Message, state: FSMContext) -> None:
+    if message.text in ("🚪 Chiqish", "/exit"):
+        await state.clear()
+        await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
+        return
+    await add_user_note(message.from_user.id, message.text.strip())
+    await state.clear()
+    await message.answer("✅ Eslatmangiz saqlandi!", reply_markup=main_reply_menu())
+
+
+# -----------------------------------------------------------
 
 
 @router.message(F.text == "📊 Mening rejimim")
@@ -1489,7 +1721,7 @@ async def handle_feedback_contact(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(FeedbackStates.waiting_text), F.text)
 async def handle_feedback_text(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1572,7 +1804,7 @@ async def handle_chat_section_start(callback: CallbackQuery, state: FSMContext) 
 
 @router.message(StateFilter(ChatModeStates.in_section), F.text)
 async def handle_chat_section_message(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Suhbat yakunlandi. Asosiy menyu:", reply_markup=main_reply_menu())
         return
@@ -1582,7 +1814,8 @@ async def handle_chat_section_message(message: Message, state: FSMContext) -> No
         "⭐ Prime olish", "📊 Mening rejimim", "⚡ Tezkor maslahatlar", "💬 Kundalik motivatsiya",
         "👤 MHDV haqida", "🤖 Bot haqida", "📜 Qoidalar", "🌐 Ijtimoiy tarmoqlar",
         "✍️ Admin bilan muloqot", "💡 Taklif va shikoyatlar", "📊 Kunlik hisobot",
-        "📊 Haftalik hisobot", "📊 Oylik hisobot",
+        "📊 Haftalik hisobot", "📊 Oylik hisobot", "🎲 Tasodifiy Fakt", "🌐 Lug'at & Imlo",
+        "💡 Kun g'oyasi", "🧮 Calculator & AI Resolver", "📑 Shaxsiy Eslatmalar"
     }
     if message.text in menu_texts:
         await state.clear()
@@ -1642,6 +1875,11 @@ async def route_menu_text_after_state_clear(message: Message, state: FSMContext)
         "📊 Kunlik hisobot": lambda: handle_reports(message),
         "📊 Haftalik hisobot": lambda: handle_reports(message),
         "📊 Oylik hisobot": lambda: handle_reports(message),
+        "🎲 Tasodifiy Fakt": lambda: handle_random_fact(message),
+        "🌐 Lug'at & Imlo": lambda: handle_dict_start(message, state),
+        "💡 Kun g'oyasi": lambda: handle_daily_idea(message),
+        "🧮 Calculator & AI Resolver": lambda: handle_math_start(message, state),
+        "📑 Shaxsiy Eslatmalar": lambda: handle_user_notes(message, state),
     }
     handler_coro_factory = text_to_handler.get(message.text)
     if handler_coro_factory:
@@ -1661,7 +1899,7 @@ async def handle_new_section_start(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(SectionCreateStates.waiting_name), F.text)
 async def handle_new_section_name(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1676,7 +1914,7 @@ async def handle_new_section_name(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(SectionCreateStates.waiting_purpose), F.text)
 async def handle_new_section_purpose(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1741,7 +1979,7 @@ async def handle_edit_name_prompt(callback: CallbackQuery, state: FSMContext) ->
 
 @router.message(StateFilter(SectionEditStates.waiting_new_name), F.text)
 async def handle_edit_name_save(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1766,7 +2004,7 @@ async def handle_edit_purpose_prompt(callback: CallbackQuery, state: FSMContext)
 
 @router.message(StateFilter(SectionEditStates.waiting_new_purpose), F.text)
 async def handle_edit_purpose_save(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1853,7 +2091,7 @@ async def handle_website_order_start(message: Message, state: FSMContext) -> Non
 
 @router.message(StateFilter(WebsiteOrderStates.waiting_site_type), F.text)
 async def handle_website_site_type(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1864,7 +2102,7 @@ async def handle_website_site_type(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(WebsiteOrderStates.waiting_requirements), F.text)
 async def handle_website_requirements(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1875,7 +2113,7 @@ async def handle_website_requirements(message: Message, state: FSMContext) -> No
 
 @router.message(StateFilter(WebsiteOrderStates.waiting_budget), F.text)
 async def handle_website_budget(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1886,7 +2124,7 @@ async def handle_website_budget(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(WebsiteOrderStates.waiting_deadline), F.text)
 async def handle_website_deadline(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1958,7 +2196,7 @@ async def handle_logo_order_start(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(LogoOrderStates.waiting_style), F.text)
 async def handle_logo_style(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1969,7 +2207,7 @@ async def handle_logo_style(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(LogoOrderStates.waiting_requirements), F.text)
 async def handle_logo_requirements(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1980,7 +2218,7 @@ async def handle_logo_requirements(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(LogoOrderStates.waiting_budget), F.text)
 async def handle_logo_budget(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -1991,7 +2229,7 @@ async def handle_logo_budget(message: Message, state: FSMContext) -> None:
 
 @router.message(StateFilter(LogoOrderStates.waiting_deadline), F.text)
 async def handle_logo_deadline(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Asosiy menyuga qaytdingiz.", reply_markup=main_reply_menu())
         return
@@ -2133,7 +2371,7 @@ async def handle_payment_reject(callback: CallbackQuery) -> None:
 
 
 # ============================================================================
-# 12. ADMIN — AUTHENTICATION (/adminOpen)
+# 12. ADMIN — AUTHENTICATION (/adminOpen) & LOCKED EXIT INTERCEPTOR
 # ============================================================================
 
 
@@ -2155,7 +2393,11 @@ async def handle_admin_password(message: Message, state: FSMContext) -> None:
     correct_password = await get_setting("admin_password", ADMIN_PASSWORD)
     if message.text.strip() == correct_password:
         await state.clear()
-        await message.answer("✅ Xush kelibsiz, Admin!", reply_markup=admin_panel_reply_keyboard())
+        RUNTIME_CACHE["admin_in_panel"].add(message.from_user.id)
+        await message.answer(
+            "✅ Xush kelibsiz, Admin!\n\n⚠️ Admin paneldan faqat <code>/exit</code> komandasi orqali chiqishingiz mumkin.",
+            reply_markup=admin_panel_reply_keyboard(),
+        )
     else:
         await message.answer("❌ Noto'g'ri parol. Qaytadan urinib ko'ring:")
 
@@ -2196,7 +2438,7 @@ async def handle_admin_change_card_prompt(message: Message, state: FSMContext) -
 
 @router.message(StateFilter(AdminSettingsStates.waiting_card), F.text)
 async def handle_admin_change_card_save(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
         return
@@ -2218,7 +2460,7 @@ async def handle_admin_change_contact_prompt(message: Message, state: FSMContext
 
 @router.message(StateFilter(AdminSettingsStates.waiting_contact), F.text)
 async def handle_admin_change_contact_save(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
         return
@@ -2236,7 +2478,7 @@ async def handle_admin_broadcast_prompt(message: Message, state: FSMContext) -> 
 
 @router.message(StateFilter(AdminBroadcastStates.waiting_content), F.text)
 async def handle_admin_broadcast_confirm(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
         return
@@ -2287,7 +2529,7 @@ async def handle_admin_add_channel_prompt(message: Message, state: FSMContext) -
 
 @router.message(StateFilter(AdminAddChannelStates.waiting_id), F.text)
 async def handle_admin_add_channel_id(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
         return
@@ -2298,7 +2540,7 @@ async def handle_admin_add_channel_id(message: Message, state: FSMContext) -> No
 
 @router.message(StateFilter(AdminAddChannelStates.waiting_title), F.text)
 async def handle_admin_add_channel_title(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
         return
@@ -2309,7 +2551,7 @@ async def handle_admin_add_channel_title(message: Message, state: FSMContext) ->
 
 @router.message(StateFilter(AdminAddChannelStates.waiting_link), F.text)
 async def handle_admin_add_channel_link(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
         return
@@ -2353,7 +2595,7 @@ async def handle_admin_add_key_prompt(message: Message, state: FSMContext) -> No
 
 @router.message(StateFilter(AdminAddApiKeyStates.waiting_key), F.text)
 async def handle_admin_add_key_save(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
         return
@@ -2387,7 +2629,7 @@ async def handle_admin_edit_key_prompt(callback: CallbackQuery, state: FSMContex
 
 @router.message(StateFilter(AdminEditTextStates.waiting_new_value), F.text)
 async def handle_admin_edit_key_save(message: Message, state: FSMContext) -> None:
-    if message.text == "🚪 Chiqish":
+    if message.text in ("🚪 Chiqish", "/exit"):
         await state.clear()
         await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
         return
@@ -2396,6 +2638,130 @@ async def handle_admin_edit_key_save(message: Message, state: FSMContext) -> Non
     await set_setting(key, message.text.strip())
     await state.clear()
     await message.answer("✅ Matn muvaffaqiyatli yangilandi!", reply_markup=admin_panel_reply_keyboard())
+
+
+# --- 5 TA YANGI ADMIN FUNKSIYALARI ---
+
+@router.message(F.text == "✏️ Avto-javob matnlarini o'zgartirish", F.from_user.id.func(is_admin))
+async def handle_admin_autoreply_menu(message: Message) -> None:
+    await message.answer("✏️ O'zgartirmoqchi bo'lgan avto-javob xabarini tanlang:", reply_markup=auto_reply_edit_choice_keyboard())
+
+
+@router.callback_query(F.data.startswith("adm_edit_autoreply:"))
+async def handle_admin_autoreply_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    key = callback.data.split(":")[1]
+    current_val = await get_setting(key)
+    await state.set_state(AdminAutoReplyStates.waiting_new_value)
+    await state.update_data(edit_key=key)
+    await callback.message.answer(
+        f"📝 Hozirgi matn:\n\n{current_val}\n\nYangi avto-javob matnini kiriting:",
+        reply_markup=exit_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(AdminAutoReplyStates.waiting_new_value), F.text)
+async def handle_admin_autoreply_save(message: Message, state: FSMContext) -> None:
+    if message.text in ("🚪 Chiqish", "/exit"):
+        await state.clear()
+        await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
+        return
+    data = await state.get_data()
+    key = data.get("edit_key")
+    await set_setting(key, message.text.strip())
+    await state.clear()
+    await message.answer("✅ Avto-javob matni yangilandi!", reply_markup=admin_panel_reply_keyboard())
+
+
+@router.message(F.text == "📜 Tizim Loglarini Ko'rish", F.from_user.id.func(is_admin))
+async def handle_admin_view_logs(message: Message) -> None:
+    log_file = "bot.log"
+    if not os.path.exists(log_file):
+        await message.answer("📜 Hali log fayl yaratilmagan.")
+        return
+    try:
+        with open(log_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        last_lines = "".join(lines[-30:])
+        await message.answer(f"📜 <b>Oxirgi 30 ta log yozuvlari:</b>\n\n<code>{last_lines[:3800]}</code>")
+    except Exception as err:
+        await message.answer(f"❌ Loglarni o'qishda xatolik: {err}")
+
+
+@router.message(F.text == "⚠️ Foydalanuvchini Ogohlantirish", F.from_user.id.func(is_admin))
+async def handle_admin_warn_start(message: Message, state: FSMContext) -> None:
+    await state.set_state(AdminWarnStates.waiting_user_id)
+    await message.answer("⚠️ Ogohlantirish yubormoqchi bo'lgan foydalanuvchi ID sini kiriting:", reply_markup=exit_keyboard())
+
+
+@router.message(StateFilter(AdminWarnStates.waiting_user_id), F.text)
+async def handle_admin_warn_user_id(message: Message, state: FSMContext) -> None:
+    if message.text in ("🚪 Chiqish", "/exit"):
+        await state.clear()
+        await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
+        return
+    try:
+        uid = int(message.text.strip())
+        await state.update_data(target_uid=uid)
+        await state.set_state(AdminWarnStates.waiting_reason)
+        await message.answer("⚠️ Ogohlantirish sababini yozing:", reply_markup=exit_keyboard())
+    except ValueError:
+        await message.answer("❌ Yaroqsiz ID format.")
+
+
+@router.message(StateFilter(AdminWarnStates.waiting_reason), F.text)
+async def handle_admin_warn_reason(message: Message, state: FSMContext) -> None:
+    if message.text in ("🚪 Chiqish", "/exit"):
+        await state.clear()
+        await message.answer("🚪 Admin panelga qaytdingiz.", reply_markup=admin_panel_reply_keyboard())
+        return
+    data = await state.get_data()
+    uid = data.get("target_uid")
+    reason = message.text.strip()
+    await state.clear()
+    try:
+        await bot.send_message(
+            uid,
+            f"⚠️ <b>ADMINISTRATSIYA OGOHLANTIRISHI!</b>\n\n"
+            f"Sabab: {reason}\n"
+            f"<i>Iltimos, botdan foydalanish qoidalariga rioya qiling.</i>"
+        )
+        await message.answer("✅ Ogohlantirish muvaffaqiyatli yuborildi!", reply_markup=admin_panel_reply_keyboard())
+    except Exception as err:
+        await message.answer(f"❌ Xabarni yuborib bo'lmadi: {err}", reply_markup=admin_panel_reply_keyboard())
+
+
+@router.message(F.text == "📊 Tizim Resurslari (RAM/CPU)", F.from_user.id.func(is_admin))
+async def handle_admin_system_resources(message: Message) -> None:
+    uptime_seconds = time.time() - start_time
+    hours, remainder = divmod(uptime_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    msg = (
+        "📊 <b>Tizim Resurslari & Holati</b>\n\n"
+        f"⏱️ Bot Islash Vaqti: {int(hours)}s {int(minutes)}m {int(seconds)}s\n"
+        f"💻 Python Versiyasi: {sys.version.split()[0]}\n"
+        f"📂 DB Hajmi: {os.path.getsize(DB_PATH) / (1024*1024):.2f} MB\n"
+        f"🔌 Status: Operational"
+    )
+    await message.answer(msg)
+
+
+@router.message(F.text == "⚡ Tezkor DB Backup", F.from_user.id.func(is_admin))
+async def handle_admin_db_backup(message: Message) -> None:
+    if not os.path.exists(DB_PATH):
+        await message.answer("❌ DB fayli topilmadi.")
+        return
+    try:
+        doc = FSInputFile(DB_PATH)
+        await message.answer_document(doc, caption=f"⚡ Ma'lumotlar bazasi zaxira nusxasi (Backup)\n📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+    except Exception as err:
+        await message.answer(f"❌ Backup olishda xatolik: {err}")
+
+
+# -----------------------------------------------------------
 
 
 @router.message(F.text == "👥 Foydalanuvchilar", F.from_user.id.func(is_admin))
@@ -2451,62 +2817,8 @@ async def handle_admin_back_panel(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "adm_stats")
-async def handle_admin_stats(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
-        return
-    stats = await get_statistics()
-    text = (
-        "📊 <b>Statistika</b>\n\n"
-        f"👥 Jami foydalanuvchilar: {stats['total_users']}\n"
-        f"⭐ Prime foydalanuvchilar: {stats['total_prime']}\n"
-        f"🔒 Bloklanganlar: {stats['total_blocked']}\n"
-        f"💬 Jami xabarlar (token o'rniga): {stats['total_messages']}\n"
-        f"🔑 Faol API kalitlar: {stats['active_keys']}\n"
-        f"📈 Kalitlar umumiy ishlatilishi: {stats['total_key_usage']}\n\n"
-        f"📅 Bugungi xabarlar: {stats['today_messages']}\n"
-        f"📅 Haftalik xabarlar: {stats['week_messages']}\n"
-        f"📅 Oylik xabarlar: {stats['month_messages']}"
-    )
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Admin panel", callback_data="adm_back_panel")]]
-        ),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "adm_clear_cache")
-async def handle_admin_clear_cache(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
-        return
-    RUNTIME_CACHE["bridge_targets"].clear()
-    RUNTIME_CACHE["admin_awaiting_reply_from"].clear()
-    await callback.answer("🧹 RAM kesh tozalandi.", show_alert=True)
-
-
-@router.callback_query(F.data == "adm_toggle_bot")
-async def handle_admin_toggle_bot(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
-        return
-    RUNTIME_CACHE["bot_enabled"] = not RUNTIME_CACHE["bot_enabled"]
-    new_status = "on" if RUNTIME_CACHE["bot_enabled"] else "off"
-    await set_setting("bot_status", new_status)
-    status_text = "🟢 YOQILDI" if RUNTIME_CACHE["bot_enabled"] else "🔴 O'CHIRILDI"
-    await callback.answer(f"Bot holati: {status_text}", show_alert=True)
-
-
-# ============================================================================
-# 14. ADMIN — USER MANAGEMENT (PROFILES, BLOCK, PRIME, HISTORY, BRIDGE)
-# ============================================================================
-
-
 @router.callback_query(F.data.startswith("adm_users:"))
-async def handle_admin_users_page(callback: CallbackQuery) -> None:
+async def handle_admin_users_pagination(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return
     page = int(callback.data.split(":")[1])
@@ -2532,9 +2844,7 @@ async def handle_admin_user_profile(callback: CallbackQuery) -> None:
     text = format_user_profile(db_user)
     await callback.message.edit_text(
         text,
-        reply_markup=admin_profile_keyboard(
-            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
-        ),
+        reply_markup=admin_profile_keyboard(target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page),
     )
     await callback.answer()
 
@@ -2546,13 +2856,12 @@ async def handle_admin_block_user(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     target_id = int(parts[1])
     back_page = int(parts[2])
-    await set_block_status(target_id, blocked=True)
+    await set_block_status(target_id, True)
     db_user = await get_user(target_id)
+    text = format_user_profile(db_user)
     await callback.message.edit_text(
-        format_user_profile(db_user),
-        reply_markup=admin_profile_keyboard(
-            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
-        ),
+        text,
+        reply_markup=admin_profile_keyboard(target_id, True, bool(db_user["is_prime"]), back_page),
     )
     await callback.answer("Foydalanuvchi bloklandi.")
 
@@ -2564,26 +2873,25 @@ async def handle_admin_unblock_user(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")
     target_id = int(parts[1])
     back_page = int(parts[2])
-    await set_block_status(target_id, blocked=False)
+    await set_block_status(target_id, False)
     db_user = await get_user(target_id)
+    text = format_user_profile(db_user)
     await callback.message.edit_text(
-        format_user_profile(db_user),
-        reply_markup=admin_profile_keyboard(
-            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
-        ),
+        text,
+        reply_markup=admin_profile_keyboard(target_id, False, bool(db_user["is_prime"]), back_page),
     )
     await callback.answer("Foydalanuvchi blokdan chiqarildi.")
 
 
 @router.callback_query(F.data.startswith("adm_give_prime:"))
-async def handle_admin_give_prime_prompt(callback: CallbackQuery) -> None:
+async def handle_admin_give_prime_menu(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return
     parts = callback.data.split(":")
     target_id = int(parts[1])
     back_page = int(parts[2])
     await callback.message.edit_text(
-        f"⭐ <code>{target_id}</code> IDli foydalanuvchiga necha oyga Prime berishni tanlang:",
+        f"⭐ <code>{target_id}</code> IDli foydalanuvchiga necha oylik Prime bermoqchisiz?",
         reply_markup=prime_months_keyboard(target_id, back_page),
     )
     await callback.answer()
@@ -2599,25 +2907,20 @@ async def handle_admin_set_prime_execute(callback: CallbackQuery) -> None:
     back_page = int(parts[3])
     await grant_prime(target_id, months)
     db_user = await get_user(target_id)
+    text = format_user_profile(db_user)
     await callback.message.edit_text(
-        f"✅ {months} oyga Prime berildi!\n\n" + format_user_profile(db_user),
-        reply_markup=admin_profile_keyboard(
-            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
-        ),
+        text,
+        reply_markup=admin_profile_keyboard(target_id, bool(db_user["is_blocked"]), True, back_page),
     )
     try:
-        await bot.send_message(
-            target_id,
-            f"🎉 Tabriklaymiz! Sizga {months} oyga Prime tarifi taqdim etildi! "
-            f"Endi botdan cheksiz foydalanishingiz mumkin.",
-        )
-    except (TelegramBadRequest, TelegramForbiddenError):
+        await bot.send_message(target_id, f"🎉 Tabriklaymiz! Sizga {months} oyga Prime tarifi berildi!")
+    except Exception:
         pass
-    await callback.answer("Prime berildi.")
+    await callback.answer(f"{months} oy Prime berildi.")
 
 
 @router.callback_query(F.data.startswith("adm_take_prime:"))
-async def handle_admin_take_prime_execute(callback: CallbackQuery) -> None:
+async def handle_admin_take_prime(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return
     parts = callback.data.split(":")
@@ -2625,38 +2928,31 @@ async def handle_admin_take_prime_execute(callback: CallbackQuery) -> None:
     back_page = int(parts[2])
     await revoke_prime(target_id)
     db_user = await get_user(target_id)
+    text = format_user_profile(db_user)
     await callback.message.edit_text(
-        "🚫 Prime olib qo'yildi.\n\n" + format_user_profile(db_user),
-        reply_markup=admin_profile_keyboard(
-            target_id, bool(db_user["is_blocked"]), bool(db_user["is_prime"]), back_page
-        ),
+        text,
+        reply_markup=admin_profile_keyboard(target_id, bool(db_user["is_blocked"]), False, back_page),
     )
-    await callback.answer("Prime olib qo'yildi.")
+    await callback.answer("Prime bekor qilindi.")
 
 
 @router.callback_query(F.data.startswith("adm_history:"))
-async def handle_admin_view_user_history(callback: CallbackQuery) -> None:
+async def handle_admin_view_history(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return
     parts = callback.data.split(":")
     target_id = int(parts[1])
     back_page = int(parts[2])
-
     history = await get_full_user_history(target_id)
     if not history:
-        await callback.answer("Bu foydalanuvchida suhbatlar tarixi mavjud emas.", show_alert=True)
+        await callback.answer("Yozishmalar mavjud emas.", show_alert=True)
         return
-
-    full_text = f"💬 <b>Foydalanuvchi ({target_id}) suhbatlar tarixi:</b>\n\n"
-    for row in history[-30:]:
-        role = "👤" if row["role"] == "user" else "🤖"
-        full_text += f"{role} [{row['timestamp'][11:16]}]: {row['content'][:150]}\n"
-
-    if len(full_text) > 4000:
-        full_text = full_text[:4000] + "\n..."
-
+    text = f"💬 <b>Foydalanuvchi yozishmalari ({target_id}):</b>\n\n"
+    for item in history[-15:]:
+        role = "👤" if item["role"] == "user" else "🤖"
+        text += f"{role} {item['content'][:150]}\n---\n"
     await callback.message.edit_text(
-        full_text,
+        text[:4000],
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"adm_profile:{target_id}:{back_page}")]]
         ),
@@ -2665,95 +2961,57 @@ async def handle_admin_view_user_history(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("adm_bridge:"))
-async def handle_admin_start_bridge(callback: CallbackQuery, state: FSMContext) -> None:
+async def handle_admin_bridge_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(callback.from_user.id):
         return
     parts = callback.data.split(":")
     target_id = int(parts[1])
-
     RUNTIME_CACHE["bridge_targets"][callback.from_user.id] = target_id
-    RUNTIME_CACHE["admin_awaiting_reply_from"][target_id] = callback.from_user.id
-
     await state.set_state(AdminBridgeStates.active)
     await callback.message.answer(
-        f"✍️ <code>{target_id}</code> IDli foydalanuvchi bilan Bridge (jonli muloqot) rejimi yoqildi.\n"
-        f"Yozgan xabarlaringiz to'g'ridan-to'g'ri unga boradi.\n"
-        f"Tugatish uchun \"🛑 Bridge'ni tugatish\" tugmasini bosing.",
+        f"🌉 <b>Bridge rejimi faollashdi!</b>\n\n"
+        f"Endi yuborgan xabarlaringiz to'g'ridan-to'g'ri <code>{target_id}</code> ga yuboriladi.",
         reply_markup=bridge_end_keyboard(),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "adm_bridge_stop")
-async def handle_admin_stop_bridge(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
-        return
+async def handle_admin_bridge_stop(callback: CallbackQuery, state: FSMContext) -> None:
     admin_id = callback.from_user.id
-    target_id = RUNTIME_CACHE["bridge_targets"].pop(admin_id, None)
-    if target_id:
-        RUNTIME_CACHE["admin_awaiting_reply_from"].pop(target_id, None)
+    if admin_id in RUNTIME_CACHE["bridge_targets"]:
+        del RUNTIME_CACHE["bridge_targets"][admin_id]
     await state.clear()
     await callback.message.edit_text("🛑 Bridge rejimi yakunlandi.")
-    await callback.message.answer("Admin panel:", reply_markup=admin_panel_reply_keyboard())
     await callback.answer()
 
 
 @router.message(StateFilter(AdminBridgeStates.active), F.text)
-async def handle_admin_bridge_message(message: Message, state: FSMContext) -> None:
+async def handle_admin_bridge_message(message: Message) -> None:
     admin_id = message.from_user.id
     target_id = RUNTIME_CACHE["bridge_targets"].get(admin_id)
     if not target_id:
-        await state.clear()
-        await message.answer("Bridge target topilmadi.", reply_markup=admin_panel_reply_keyboard())
         return
-
     try:
-        await bot.send_message(
-            target_id,
-            f"👨‍💻 <b>Admin:</b>\n\n{message.text}",
-        )
-        await message.answer("✅ Xabar yuborildi.", reply_markup=bridge_end_keyboard())
-    except (TelegramBadRequest, TelegramForbiddenError) as err:
-        await message.answer(f"❌ Xabar yetkazilmadi: {err}", reply_markup=bridge_end_keyboard())
+        await bot.send_message(target_id, f"👨‍💻 <b>Admin:</b> {message.text}")
+        await message.answer("✅ Yuborildi.")
+    except Exception as err:
+        await message.answer(f"❌ Xabarni yuborishda xatolik: {err}")
 
 
 # ============================================================================
-# 15. GLOBAL ROUTER FOR BRIDGE REVERSE MESSAGES FROM USERS
+# 14. APPLICATION STARTUP & MAIN LOOP
 # ============================================================================
 
 
-@router.message(F.text, F.from_user.id.func(lambda uid: uid in RUNTIME_CACHE["admin_awaiting_reply_from"]))
-async def handle_user_bridge_reply(message: Message) -> None:
-    user_id = message.from_user.id
-    admin_id = RUNTIME_CACHE["admin_awaiting_reply_from"].get(user_id)
-    if admin_id:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"💬 <b>Foydalanuvchi ({user_id}) javob berdi:</b>\n\n{message.text}",
-                reply_markup=bridge_end_keyboard(),
-            )
-        except (TelegramBadRequest, TelegramForbiddenError):
-            pass
-
-
-# ============================================================================
-# 16. APPLICATION STARTUP & MAIN LOOP
-# ============================================================================
+start_time = time.time()
 
 
 async def main() -> None:
-    logger.info("Bot ma'lumotlar bazasi va tizim komponentlari ishga tushirilmoqda...")
+    logger.info("Bot ma'lumotlar bazasi va parametrlari yuklanmoqda...")
     await init_db()
-
-    bot_status = await get_setting("bot_status", "on")
-    RUNTIME_CACHE["bot_enabled"] = (bot_status == "on")
-
-    logger.info("Bot Telegram API ga muvaffaqiyatli ulandi va so'rovlarni qabul qilishni boshladi.")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    logger.info("MHDV AI Bot muvaffaqiyatli ishga tushirildi!")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
