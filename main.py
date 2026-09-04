@@ -30,10 +30,9 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ContentType, ParseMode
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -3479,11 +3478,9 @@ async def main():
     await init_db()
 
     bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    ),
-)
+        token=BOT_TOKEN,
+        parse_mode=ParseMode.HTML,
+    )
 
     dp = Dispatcher()
 
